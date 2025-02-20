@@ -13,6 +13,9 @@ save_fastmap_value <- function(
       arrow::write_parquet(mtcars, f)
       arrow::read_parquet(f)
     },
+    "data.frame" = {
+      mtcars
+    },
     "integer" = 1L
   )
 

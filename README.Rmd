@@ -58,7 +58,7 @@ scenarios <- expand.grid(
   "covr remote" = c("covr", "r-lib/covr"),
   "covr version" = "",
   "fastmap init" = c("global", "lazy-stub", "lazy-fastmap", "runtime", "buildtime"),
-  "fastmap value" = c("integer", "parquet"),
+  "fastmap value" = c("integer", "data.frame", "parquet"),
   "exit status" = 0,
   stringsAsFactors = FALSE
 )
