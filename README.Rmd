@@ -1,0 +1,175 @@
+---
+output: rmarkdown::github_document
+---
+
+# `covr` segfault reprex
+
+A unique scenario, where a `fastmap` is created and used to store a `parquet`
+`data.frame` produces a segfault when `covr` tries to save traces using
+`saveRDS`.
+
+In its simplest form, this would be produced from a package that tests a
+function such:
+
+```r
+function(f) {
+  m <- fastmap::fastmap()  
+  m$set("data", arrow::read_parquet(f))
+}
+```
+
+The details get far messier, so I've tested quite a few different scenarios
+to try to pin down what is necessary to prompt a segfault:
+
+## Parameters
+
+* **fastmap value**: the type of value to be stored in the `fastmap`
+* **fastmap init**: how the `fastmap` is initialized  
+  either at
+  [build, runtime, lazily](https://github.com/dgkf/reprex-covr-segfault/blob/02913e0e5d397a33574b056bc78cb168933aae69/R/parquet-fastmap.R#L1-L3),
+  or in the [gloabl env](https://github.com/dgkf/reprex-covr-segfault/blob/02913e0e5d397a33574b056bc78cb168933aae69/R/onload.R#L5-L6)
+* **`.onLoad` if()**: whether there is an `if` block in the `.onLoad` function  
+  believe it or not, this affects whether `covr` segfaults in some cases.
+* **covr source and version**: either released `covr` on **CRAN** or the dev
+  build of covr.
+
+Note that S3 methods are registered `onLoad` because registering them
+using the `NAMESPACE` had a similar effect to using an `.onLoad` `if ()` block.
+
+## Tests
+
+<details>
+<summary>
+<strong><i>code</i></strong>
+</summary>
+
+```{r, warning = FALSE, message = FALSE}
+# if a dev version of covr is installed in library, will need to be uninstalled
+
+dir.create(lib_covr_cran <- file.path(tempdir(), "lib_covr_cran"))
+install.packages("covr", lib = lib_covr_cran)
+
+dir.create(lib_covr_dev <- file.path(tempdir(), "lib_covr_dev"))
+remotes::install_github("r-lib/covr", lib = lib_covr_dev, force = TRUE, quiet = TRUE)
+# pak::pkg_install("r-lib/covr", lib = lib_covr_dev)
+
+scenarios <- expand.grid(
+  "onLoad if()" = c(TRUE, FALSE),
+  "covr remote" = c("covr", "r-lib/covr"),
+  "covr version" = "",
+  "fastmap init" = c("global", "lazy-stub", "lazy-fastmap", "runtime", "buildtime"),
+  "fastmap value" = c("integer", "parquet"),
+  "exit status" = 0,
+  stringsAsFactors = FALSE
+)
+
+cols <- c("fastmap value", "fastmap init", "onLoad if()", "covr remote", "covr version", "exit status")
+scenarios <- scenarios[, cols]
+
+for (i in seq_len(nrow(scenarios))) {
+  cat("running scenario", i, "... \n")
+  scenario <- as.list(scenarios[i, ])
+
+  onload <- readLines("R/onload.R")
+  onload[[3]] <- if (scenario[["onLoad if()"]]) "  if (TRUE) {}" else ""
+  writeLines(onload, "R/onload.R")
+
+  envvars <- c(
+    "REPREX_FASTMAP_INIT_STYLE" = scenario[["fastmap init"]],
+    "REPREX_FASTMAP_VALUE_TYPE" = scenario[["fastmap value"]]
+  )
+
+  libs <- c(
+    switch(scenario[["covr remote"]],
+      "covr" = lib_covr_cran,
+      "r-lib/covr" = lib_covr_dev
+    ),
+    .libPaths()
+  )
+
+  scenarios[[i, "covr version"]] <-
+    as.character(packageVersion("covr", lib.loc = libs))
+
+  x <- processx::process$new(
+    command = file.path(R.home(), "bin", "R"),
+    args = c(
+      "--quiet",
+      "--vanilla",
+      "-e", paste0(collapse = " ", deparse(bquote(.libPaths(.(libs))))),
+      "-e", "print(Sys.getenv()[which(startsWith(names(Sys.getenv()), 'REPREX'))])",
+      "-e", "covr::package_coverage()"
+    ),
+    env = envvars,
+    stdout = "|",
+    stderr = "2>&1"
+  )
+
+  x$wait()
+  scenarios[[i, "exit status"]] <- x$get_exit_status()
+  cat(paste0("## ", x$read_all_output_lines(), collapse = "\n"), "\n\n")
+}
+
+scenarios
+```
+
+</details>
+
+```{r, echo = FALSE, results = "asis"}
+x <- scenarios
+x[["exit status"]] <- ifelse(x[["exit status"]] == 0, ":white_check_mark:", ":x:")
+x[["covr version"]] <- paste0("`v", x[["covr version"]], "`")
+
+cat(
+  sep = "",
+  "| ", paste(colnames(x), collapse = " | "), " |\n",
+  "| ", paste(rep_len("---", ncol(x)), collapse = " | "), " |\n",
+  paste("|", apply(x, 1L, paste, collapse = " | "), "|", collapse = "\n"),
+  "\n"
+)
+```
+
+## Discussion
+
+Documenting a few patterns I've noticed while trying to decipher this bug.
+I'll walk through the table above from groups of scenarios from left to right.
+
+### Fastmap Value
+
+The value type stored is important. `covr` can safely handle integers, and
+presumably other atomic data types without issue. I first encountered the
+problem with `data.frame`s loaded using `parquet`, so that is what is used
+otherwise.
+
+From this, we can tell that solely _using_ fastmap to store values is not
+sufficient to hit this bug.
+
+## Fastmap Initialization
+
+Next we can look at the way a `fastmap` object is initialized. For atomic
+types, even a `fastmap` initialized in the package namespace will not through
+an error. It's not entirely clear when `fastmap` might allocate memory, but I
+assume this _is not_ something one should generally do on build anyways.
+
+Scanning further down the table, we can see that using a `fastmap` defined in
+the global environment is perfectly fine, so it is not sufficient to simply
+use fastmap, it necessarily needs to be used within the package namespace.
+
+Storing a `parquet` file in a simple list using `lazy-stub` (faking the
+`fastmap` api) is also perfectly fine.
+
+## `.onLoad` `if()`
+
+We'll focus now on the last 12 rows, which showcase a preplexing behavior using
+the CRAN version of `covr`.
+
+Broadly, storing a `parquet` `data.frame` in a `fastmap` will cause a segfault,
+whether the `fastmap` is initialized at buildtime, at runtime or lazily as the
+`fastmap` is accessed by hooking in to the `$` generic.
+
+_However_, bizarrely enough, there are certain snippets of code, that if
+present somewhere in the package, will allow `covr` to succeed. One oddity that
+I was able to pin down was whether or not `.onLoad` contained an `if` block. If
+one exists (and in this case it's just a `if (TRUE) {}`), then `covr` is able
+to dodge a segfault. I think this was also affected by whether or not an S3
+generic was exported in the `NAMESPACE`, hence why S3 methods are registered
+only `.onLoad`, but I didn't investigate this exhaustively.
